@@ -1,0 +1,30 @@
+[Unit]
+Description=Webhook Listener Server for WordPress Plugin Deployment
+Documentation=https://github.com/youruser/webhook-listener
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=webhook-listener
+Group=webhook-listener
+WorkingDirectory=/home/webhook-listener
+ExecStart=/usr/local/bin/webhook-listener listen --port 3000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=webhook-listener
+
+# Security settings
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/webhook-listener/.webhook-listener
+
+# Environment variables (optional)
+Environment=WEBHOOK_PORT=3000
+Environment=WEBHOOK_SECRET=
+
+[Install]
+WantedBy=multi-user.target

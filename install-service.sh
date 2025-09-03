@@ -1,10 +1,10 @@
 #!/bin/bash
 set -e
 
-SERVICE_NAME="wpp-deployer-webhook"
+SERVICE_NAME="webhook-listener"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-USER_NAME="wpp-deployer"
-WORKING_DIR="/opt/wpp-deployer"
+USER_NAME="webhook-listener"
+WORKING_DIR="/home/webhook-listener"
 
 # Check if we're running as root
 if [[ $EUID -ne 0 ]]; then
@@ -12,7 +12,7 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-echo "Installing wpp-deployer webhook service..."
+echo "Installing webhook listener service..."
 
 # Create user if it doesn't exist
 if ! id "$USER_NAME" &>/dev/null; then
@@ -27,21 +27,14 @@ if [[ ! -d "$WORKING_DIR" ]]; then
     chown "$USER_NAME:$USER_NAME" "$WORKING_DIR"
 fi
 
-# Create log directory
-if [[ ! -d "/var/log/wpp-deployer" ]]; then
-    echo "Creating log directory: /var/log/wpp-deployer"
-    mkdir -p "/var/log/wpp-deployer"
-    chown "$USER_NAME:$USER_NAME" "/var/log/wpp-deployer"
-fi
-
 # Copy service file
-if [[ ! -f "wpp-deployer-webhook.service" ]]; then
-    echo "Error: Service file 'wpp-deployer-webhook.service' not found"
+if [[ ! -f "webhook-listener.service" ]]; then
+    echo "Error: Service file 'webhook-listener.service' not found"
     exit 1
 fi
 
 echo "Installing service file to $SERVICE_FILE"
-cp "wpp-deployer-webhook.service" "$SERVICE_FILE"
+cp "webhook-listener.service" "$SERVICE_FILE"
 chmod 644 "$SERVICE_FILE"
 
 # Reload systemd
