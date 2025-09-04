@@ -10,8 +10,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -54,20 +52,14 @@ type Repository struct {
 }
 
 type WebhookServer struct {
-	port      string
-	secret    string
-	configMgr *ConfigManager
-	deployer  *DeployerClient
+	port   string
+	secret string
 }
 
 func NewWebhookServer(port, secret string) *WebhookServer {
-	workDir := filepath.Join(os.Getenv("HOME"), ".webhook-listener")
-
 	return &WebhookServer{
-		port:      port,
-		secret:    secret,
-		configMgr: NewConfigManager(workDir),
-		deployer:  NewDeployerClient(),
+		port:   port,
+		secret: secret,
 	}
 }
 
@@ -158,9 +150,8 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, payload *GitHubPayl
 		fmt.Printf("[%s] 📤 Push to %s\n", timestamp, repo)
 		fmt.Printf("         Branch: %s\n", branch)
 		fmt.Printf("         Commits: %s...%s\n", payload.Before[:8], payload.After[:8])
+		fmt.Printf("         [📝] Repo: %s, Branch: %s\n", repo, branch)
 		fmt.Println()
-
-		ws.handleRepositoryEvent(repo, branch, payload.Repository.CloneURL)
 
 	case "ping":
 		fmt.Printf("[%s] 🏓 Webhook ping from %s\n", timestamp, repo)
@@ -174,110 +165,6 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, payload *GitHubPayl
 		}
 		fmt.Println()
 	}
-}
-
-func (ws *WebhookServer) handleRepositoryEvent(repoFullName, branch, cloneURL string) {
-	config, err := ws.configMgr.GetRepoConfig(repoFullName)
-	if err != nil {
-		fmt.Printf("         [!] Repository %s not configured for deployment: %v\n", repoFullName, err)
-		return
-	}
-
-	fmt.Printf("         [+] Repository configured for deployment\n")
-	fmt.Printf("         [+] Script: %s\n", config.Script)
-
-	if err := ws.processRepository(repoFullName, branch, cloneURL, config); err != nil {
-		fmt.Printf("         [!] Processing failed: %v\n", err)
-		return
-	}
-
-	fmt.Printf("         [✔] Repository processing completed successfully!\n")
-	fmt.Println()
-}
-
-func (ws *WebhookServer) processRepository(repoFullName, branch, cloneURL string, config *RepoConfig) error {
-	workDir := ws.configMgr.GetWorkDir()
-	repoDir := filepath.Join(workDir, "repos", repoFullName)
-
-	if err := os.MkdirAll(filepath.Dir(repoDir), 0755); err != nil {
-		return fmt.Errorf("failed to create repos directory: %w", err)
-	}
-
-	if err := ws.cloneOrUpdateRepo(repoDir, cloneURL, branch); err != nil {
-		return fmt.Errorf("failed to clone/update repository: %w", err)
-	}
-
-	if err := ws.runBuildScript(repoDir, config.Script, repoFullName, branch); err != nil {
-		return fmt.Errorf("failed to run build script: %w", err)
-	}
-
-	siteName, err := ws.deployer.DeployWithPlugin(repoDir, repoFullName, branch)
-	if err != nil {
-		return fmt.Errorf("failed to deploy with wpp-deployer: %w", err)
-	}
-
-	fmt.Printf("         [+] Site deployed: %s.nshlog.com\n", siteName)
-	return nil
-}
-
-func (ws *WebhookServer) cloneOrUpdateRepo(repoDir, cloneURL, branch string) error {
-	fmt.Printf("         [+] Updating repository...\n")
-
-	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
-		fmt.Printf("         [+] Cloning repository...\n")
-		cmd := exec.Command("git", "clone", "--depth", "1", "--branch", branch, cloneURL, repoDir)
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git clone failed: %w", err)
-		}
-	} else {
-		fmt.Printf("         [+] Pulling latest changes...\n")
-
-		cmd := exec.Command("git", "reset", "--hard")
-		cmd.Dir = repoDir
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git reset failed: %w", err)
-		}
-
-		cmd = exec.Command("git", "checkout", branch)
-		cmd.Dir = repoDir
-		if err := cmd.Run(); err != nil {
-			cmd = exec.Command("git", "checkout", "-b", branch, "origin/"+branch)
-			cmd.Dir = repoDir
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("git checkout failed: %w", err)
-			}
-		}
-
-		cmd = exec.Command("git", "pull", "origin", branch)
-		cmd.Dir = repoDir
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git pull failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (ws *WebhookServer) runBuildScript(repoDir, script, repoFullName, branch string) error {
-	fmt.Printf("         [+] Running build script: %s\n", script)
-
-	cmd := exec.Command("bash", "-c", script)
-	cmd.Dir = repoDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("REPO_NAME=%s", repoFullName),
-		fmt.Sprintf("BRANCH_NAME=%s", branch),
-		fmt.Sprintf("REPO_PATH=%s", repoDir),
-	)
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("build script failed: %w", err)
-	}
-
-	fmt.Printf("         [+] Build script completed successfully!\n")
-	return nil
 }
 
 func (ws *WebhookServer) healthCheck(w http.ResponseWriter, r *http.Request) {
@@ -323,30 +210,25 @@ func (ws *WebhookServer) Start() error {
 }
 
 func printUsage() {
-	fmt.Printf(`%s v%s - GitHub Webhook Listener for WordPress Plugin Deployment
+	fmt.Printf(`%s v%s - GitHub Webhook Listener
 
 Usage:
-  %s <command> [options] [arguments]
+  %s <command> [options]
 
 Commands:
   listen [--port PORT] [--secret SECRET]  Start webhook server for GitHub events
-  add-repo <username/repo> <script>       Add a new repository configuration
-  remove-repo <username/repo>             Remove a repository configuration  
-  list-repos                              List all configured repositories
-  init                                    Initialize webhook-listener workspace
+  help                                    Show this help message
+  version                                 Show version information
 
 Options:
   --port PORT          Webhook server port (default: 3000)
   --secret SECRET      GitHub webhook secret for validation
 
 Examples:
-  %s init
+  %s listen
   %s listen --port 3000 --secret mysecret
-  %s add-repo myuser/myapp 'npm run build && cp dist/plugin.zip ./plugin.zip'
-  %s remove-repo myuser/myapp
-  %s list-repos
 
-`, appName, version, appName, appName, appName, appName, appName, appName)
+`, appName, version, appName, appName, appName)
 }
 
 func main() {
@@ -378,51 +260,6 @@ func main() {
 
 		server := NewWebhookServer(port, secret)
 		if err := server.Start(); err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "add-repo":
-		if len(os.Args) < 4 {
-			fmt.Println("Error: add-repo requires repository and script")
-			fmt.Println("Usage: webhook-listener add-repo <username/repo> <script>")
-			fmt.Println("Example: webhook-listener add-repo myuser/myapp 'npm run build && cp dist/plugin.zip ./plugin.zip'")
-			os.Exit(1)
-		}
-
-		workDir := filepath.Join(os.Getenv("HOME"), ".webhook-listener")
-		configMgr := NewConfigManager(workDir)
-
-		repo := os.Args[2]
-		script := os.Args[3]
-
-		if err := configMgr.AddRepoConfig(repo, script); err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "remove-repo":
-		if len(os.Args) < 3 {
-			fmt.Println("Error: remove-repo requires repository name")
-			fmt.Println("Usage: webhook-listener remove-repo <username/repo>")
-			os.Exit(1)
-		}
-
-		workDir := filepath.Join(os.Getenv("HOME"), ".webhook-listener")
-		configMgr := NewConfigManager(workDir)
-
-		repo := os.Args[2]
-
-		if err := configMgr.RemoveRepoConfig(repo); err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
-
-	case "list-repos":
-		workDir := filepath.Join(os.Getenv("HOME"), ".webhook-listener")
-		configMgr := NewConfigManager(workDir)
-
-		if err := configMgr.ListRepoConfigs(); err != nil {
 			fmt.Printf("Error: %v\n", err)
 			os.Exit(1)
 		}
