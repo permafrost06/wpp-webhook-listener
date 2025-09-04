@@ -22,20 +22,10 @@ const (
 type GitHubPayload struct {
 	Action      string      `json:"action"`
 	Number      int         `json:"number"`
-	PullRequest PullRequest `json:"pull_request"`
 	Repository  Repository  `json:"repository"`
 	Ref         string      `json:"ref"`
 	Before      string      `json:"before"`
 	After       string      `json:"after"`
-}
-
-type PullRequest struct {
-	Number  int    `json:"number"`
-	Title   string `json:"title"`
-	State   string `json:"state"`
-	Head    Branch `json:"head"`
-	Base    Branch `json:"base"`
-	HTMLURL string `json:"html_url"`
 }
 
 type Branch struct {
@@ -125,20 +115,6 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, payload *GitHubPayl
 	timestamp := time.Now().Format("15:04:05")
 
 	switch eventType {
-	case "pull_request":
-		action := payload.Action
-		pr := payload.PullRequest
-
-		fmt.Printf("[%s] 🔀 PR #%d %s: %s\n", timestamp, pr.Number, action, pr.Title)
-		fmt.Printf("         Repository: %s\n", repo)
-		fmt.Printf("         Branch: %s → %s\n", pr.Head.Ref, pr.Base.Ref)
-		fmt.Printf("         URL: %s\n", pr.HTMLURL)
-		fmt.Println()
-
-		if action == "opened" || action == "synchronize" {
-			ws.handleRepositoryEvent(repo, pr.Head.Ref, payload.Repository.CloneURL)
-		}
-
 	case "push":
 		ref := payload.Ref
 		branch := strings.TrimPrefix(ref, "refs/heads/")
