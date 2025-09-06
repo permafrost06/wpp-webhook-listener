@@ -62,6 +62,13 @@ type Deployment struct {
 	Created  time.Time
 }
 
+type RepoConfig struct {
+	ID       int
+	Repo     string
+	ZipPaths []string
+	Created  time.Time
+}
+
 func NewWebhookServer(port, secret string) *WebhookServer {
 	homeDir, err := os.UserHomeDir()
 	dbLocation := filepath.Join(homeDir, ".wpp-deployer", "deployments.db")
@@ -84,18 +91,36 @@ func NewWebhookServer(port, secret string) *WebhookServer {
 }
 
 func (ws *WebhookServer) initDB() error {
-	query := `
-	CREATE TABLE IF NOT EXISTS deployments (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		repo TEXT NOT NULL,
-		branch TEXT NOT NULL,
-		sitename TEXT NOT NULL,
-		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		UNIQUE(repo, branch)
-	);`
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS deployments (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			repo TEXT NOT NULL,
+			branch TEXT NOT NULL,
+			sitename TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(repo, branch)
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_configs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			repo TEXT NOT NULL UNIQUE,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS repo_zips (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			repo_config_id INTEGER NOT NULL,
+			zip_path TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (repo_config_id) REFERENCES repo_configs (id)
+		);`,
+	}
 
-	_, err := ws.db.Exec(query)
-	return err
+	for _, query := range queries {
+		if _, err := ws.db.Exec(query); err != nil {
+			return fmt.Errorf("failed to execute query: %v", err)
+		}
+	}
+
+	return ws.initRepoConfigs()
 }
 
 func (ws *WebhookServer) validateSignature(payload []byte, signature string) bool {
@@ -203,7 +228,7 @@ func (ws *WebhookServer) buildPluginAndDeploySite(repo string, branch string) {
 	go func() {
 		log.Printf("Starting build and deploy process for %s:%s", repo, branch)
 
-		if err := ws.processRepoDeployment(repo, branch); err != nil {
+		if err := ws.processRepoDeployment(strings.ToLower(repo), branch); err != nil {
 			log.Printf("Error processing deployment for %s:%s - %v", repo, branch, err)
 		}
 	}()
@@ -234,6 +259,76 @@ func (ws *WebhookServer) deployNewSite(repo string, branch string) (Deployment, 
 	deployment.Created = time.Now()
 
 	return deployment, nil
+}
+
+func (ws *WebhookServer) initRepoConfigs() error {
+	configs := map[string][]string{
+		"dotcamp/ultimate-blocks": {"packages/ultimate-blocks/zip/ultimate-blocks.zip", "packages/pro/zip/ultimate-blocks-pro.zip"},
+		"dotcamp/tableberg":       {"packages/tableberg/tableberg.zip", "packages/pro/tableberg-pro.zip"},
+	}
+
+	for repo, zipPaths := range configs {
+		var configID int
+		err := ws.db.QueryRow("SELECT id FROM repo_configs WHERE repo = ?", repo).Scan(&configID)
+
+		if err == sql.ErrNoRows {
+			result, err := ws.db.Exec("INSERT INTO repo_configs (repo) VALUES (?)", repo)
+			if err != nil {
+				return fmt.Errorf("failed to insert repo config for %s: %v", repo, err)
+			}
+
+			id, err := result.LastInsertId()
+			if err != nil {
+				return fmt.Errorf("failed to get insert ID for %s: %v", repo, err)
+			}
+			configID = int(id)
+
+			for _, zipPath := range zipPaths {
+				_, err = ws.db.Exec("INSERT INTO repo_zips (repo_config_id, zip_path) VALUES (?, ?)", configID, zipPath)
+				if err != nil {
+					return fmt.Errorf("failed to insert zip path %s for repo %s: %v", zipPath, repo, err)
+				}
+			}
+			log.Printf("Initialized repo config for %s with %d zip paths", repo, len(zipPaths))
+		} else if err != nil {
+			return fmt.Errorf("failed to query repo config for %s: %v", repo, err)
+		}
+	}
+
+	return nil
+}
+
+func (ws *WebhookServer) getRepoConfig(repo string) (*RepoConfig, error) {
+	var configID int
+	err := ws.db.QueryRow("SELECT id FROM repo_configs WHERE repo = ?", repo).Scan(&configID)
+	if err != nil {
+		return nil, fmt.Errorf("repo config not found for %s: %v", repo, err)
+	}
+
+	rows, err := ws.db.Query("SELECT zip_path FROM repo_zips WHERE repo_config_id = ?", configID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query zip paths for repo %s: %v", repo, err)
+	}
+	defer rows.Close()
+
+	var zipPaths []string
+	for rows.Next() {
+		var zipPath string
+		if err := rows.Scan(&zipPath); err != nil {
+			return nil, fmt.Errorf("failed to scan zip path: %v", err)
+		}
+		zipPaths = append(zipPaths, zipPath)
+	}
+
+	if len(zipPaths) == 0 {
+		return nil, fmt.Errorf("no zip paths configured for repo %s", repo)
+	}
+
+	return &RepoConfig{
+		ID:       configID,
+		Repo:     repo,
+		ZipPaths: zipPaths,
+	}, nil
 }
 
 func (ws *WebhookServer) processRepoDeployment(repo, branch string) error {
@@ -275,16 +370,12 @@ func (ws *WebhookServer) processRepoDeployment(repo, branch string) error {
 
 	log.Printf("Building %s:%s with Docker", repo, branch)
 
-	repoURL := fmt.Sprintf("https://github.com/%s", repo)
-
-	var zipPath string
-	if strings.Contains(repo, "ultimate-blocks") {
-		zipPath = "packages/ultimate-blocks/zip/ultimate-blocks.zip"
-	} else if strings.Contains(repo, "tableberg") {
-		zipPath = "packages/tableberg/tableberg.zip"
-	} else {
-		return fmt.Errorf("unknown repo type: %s", repo)
+	repoConfig, err := ws.getRepoConfig(repo)
+	if err != nil {
+		return fmt.Errorf("no configuration found for repo %s: %v", repo, err)
 	}
+
+	repoURL := fmt.Sprintf("https://github.com/%s", repo)
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -304,35 +395,40 @@ func (ws *WebhookServer) processRepoDeployment(repo, branch string) error {
 	dockerArgs := []string{
 		"run", "-v", fmt.Sprintf("%s:/output", absOutputDir),
 		"-v", fmt.Sprintf("%s:/pnpm/store", absStoreDir),
-		"project-builder", repoURL, branch, zipPath,
+		"project-builder", repoURL, branch,
 	}
+	dockerArgs = append(dockerArgs, repoConfig.ZipPaths...)
 
+	log.Printf("Building %d zip files: %v", len(repoConfig.ZipPaths), repoConfig.ZipPaths)
 	output, err = exec.Command("docker", dockerArgs...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker build failed: %v, output: %s", err, string(output))
 	}
 
-	builtZipPath := filepath.Join(absOutputDir, filepath.Base(zipPath))
-	if _, err := os.Stat(builtZipPath); os.IsNotExist(err) {
-		return fmt.Errorf("expected zip file not found: %s", builtZipPath)
-	}
-
-	log.Printf("Successfully built plugin: %s", builtZipPath)
-
-	log.Printf("Installing plugin %s on site %s", zipPath, deployment.Sitename)
-
 	siteDir := filepath.Join(homeDir, ".wpp-deployer", fmt.Sprintf("wordpress-%s", deployment.Sitename))
 
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "run", "-T", "--rm", "wpcli",
-		"plugin", "install", fmt.Sprintf("/zips/%s", filepath.Base(zipPath)), "--activate", "--force")
-	cmd.Dir = siteDir
+	log.Printf("Installing %d plugins on site %s", len(repoConfig.ZipPaths), deployment.Sitename)
 
-	output, err = cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("plugin installation failed: %v, output: %s", err, string(output))
+	for _, zipPath := range repoConfig.ZipPaths {
+		builtZipPath := filepath.Join(absOutputDir, filepath.Base(zipPath))
+		if _, err := os.Stat(builtZipPath); os.IsNotExist(err) {
+			log.Printf("Warning: expected zip file not found: %s", builtZipPath)
+			continue
+		}
+
+		log.Printf("Installing plugin: %s", filepath.Base(zipPath))
+
+		cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "run", "-T", "--rm", "wpcli",
+			"plugin", "install", fmt.Sprintf("/zips/%s", filepath.Base(zipPath)), "--activate", "--force")
+		cmd.Dir = siteDir
+
+		output, err = cmd.CombinedOutput()
+		if err != nil {
+			log.Printf("Plugin installation failed for %s: %v, output: %s", filepath.Base(zipPath), err, string(output))
+		} else {
+			log.Printf("Successfully installed plugin: %s", filepath.Base(zipPath))
+		}
 	}
-
-	log.Printf("Successfully installed plugin on site %s", deployment.Sitename)
 
 	log.Printf("Successfully completed build and deploy for %s:%s on site %s", repo, branch, deployment.Sitename)
 	return nil
