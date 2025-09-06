@@ -63,10 +63,12 @@ type Deployment struct {
 }
 
 type RepoConfig struct {
-	ID       int
-	Repo     string
-	ZipPaths []string
-	Created  time.Time
+	ID            int
+	Repo          string
+	ZipPaths      []string
+	CustomScript  string
+	WpcliCommands string
+	Created       time.Time
 }
 
 func NewWebhookServer(port, secret string) *WebhookServer {
@@ -103,6 +105,8 @@ func (ws *WebhookServer) initDB() error {
 		`CREATE TABLE IF NOT EXISTS repo_configs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			repo TEXT NOT NULL UNIQUE,
+			custom_script TEXT,
+			wpcli_commands TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS repo_zips (
@@ -262,17 +266,47 @@ func (ws *WebhookServer) deployNewSite(repo string, branch string) (Deployment, 
 }
 
 func (ws *WebhookServer) initRepoConfigs() error {
-	configs := map[string][]string{
-		"dotcamp/ultimate-blocks": {"packages/ultimate-blocks/zip/ultimate-blocks.zip", "packages/pro/zip/ultimate-blocks-pro.zip"},
-		"dotcamp/tableberg":       {"packages/tableberg/tableberg.zip", "packages/pro/tableberg-pro.zip"},
+	type repoConfigData struct {
+		zipPaths      []string
+		customScript  string
+		wpcliCommands string
 	}
 
-	for repo, zipPaths := range configs {
+	configs := map[string]repoConfigData{
+		"dotcamp/ultimate-blocks": {
+			zipPaths: []string{
+				"packages/ultimate-blocks/zip/ultimate-blocks.zip",
+				"packages/pro/zip/ultimate-blocks-pro.zip",
+			},
+			customScript: `#!/bin/bash
+set -e
+echo "Building Ultimate Blocks..."
+pnpm i
+pnpm run build`,
+			wpcliCommands: `wp freemius-license activate ub_pro_fs sk_12345678`,
+		},
+		"dotcamp/tableberg": {
+			zipPaths: []string{
+				"packages/tableberg/tableberg.zip",
+				"packages/pro/tableberg-pro.zip",
+			},
+			customScript: `#!/bin/bash
+set -e
+echo "Building Tableberg..."
+composer install --no-dev
+pnpm i
+pnpm run export`,
+			wpcliCommands: `wp freemius-license activate tp_fs sk_12345678`,
+		},
+	}
+
+	for repo, config := range configs {
 		var configID int
 		err := ws.db.QueryRow("SELECT id FROM repo_configs WHERE repo = ?", repo).Scan(&configID)
 
 		if err == sql.ErrNoRows {
-			result, err := ws.db.Exec("INSERT INTO repo_configs (repo) VALUES (?)", repo)
+			result, err := ws.db.Exec("INSERT INTO repo_configs (repo, custom_script, wpcli_commands) VALUES (?, ?, ?)",
+				repo, config.customScript, config.wpcliCommands)
 			if err != nil {
 				return fmt.Errorf("failed to insert repo config for %s: %v", repo, err)
 			}
@@ -283,13 +317,13 @@ func (ws *WebhookServer) initRepoConfigs() error {
 			}
 			configID = int(id)
 
-			for _, zipPath := range zipPaths {
+			for _, zipPath := range config.zipPaths {
 				_, err = ws.db.Exec("INSERT INTO repo_zips (repo_config_id, zip_path) VALUES (?, ?)", configID, zipPath)
 				if err != nil {
 					return fmt.Errorf("failed to insert zip path %s for repo %s: %v", zipPath, repo, err)
 				}
 			}
-			log.Printf("Initialized repo config for %s with %d zip paths", repo, len(zipPaths))
+			log.Printf("Initialized repo config for %s with %d zip paths, custom script, and wpcli commands", repo, len(config.zipPaths))
 		} else if err != nil {
 			return fmt.Errorf("failed to query repo config for %s: %v", repo, err)
 		}
@@ -300,7 +334,9 @@ func (ws *WebhookServer) initRepoConfigs() error {
 
 func (ws *WebhookServer) getRepoConfig(repo string) (*RepoConfig, error) {
 	var configID int
-	err := ws.db.QueryRow("SELECT id FROM repo_configs WHERE repo = ?", repo).Scan(&configID)
+	var customScript, wpcliCommands sql.NullString
+
+	err := ws.db.QueryRow("SELECT id, custom_script, wpcli_commands FROM repo_configs WHERE repo = ?", repo).Scan(&configID, &customScript, &wpcliCommands)
 	if err != nil {
 		return nil, fmt.Errorf("repo config not found for %s: %v", repo, err)
 	}
@@ -325,9 +361,11 @@ func (ws *WebhookServer) getRepoConfig(repo string) (*RepoConfig, error) {
 	}
 
 	return &RepoConfig{
-		ID:       configID,
-		Repo:     repo,
-		ZipPaths: zipPaths,
+		ID:            configID,
+		Repo:          repo,
+		ZipPaths:      zipPaths,
+		CustomScript:  customScript.String,
+		WpcliCommands: wpcliCommands.String,
 	}, nil
 }
 
@@ -395,8 +433,43 @@ func (ws *WebhookServer) processRepoDeployment(repo, branch string) error {
 	dockerArgs := []string{
 		"run", "-v", fmt.Sprintf("%s:/output", absOutputDir),
 		"-v", fmt.Sprintf("%s:/pnpm/store", absStoreDir),
-		"project-builder", repoURL, branch,
 	}
+
+	var scriptPath string
+	if repoConfig.CustomScript != "" {
+		scriptContent := repoConfig.CustomScript
+		if !strings.HasPrefix(scriptContent, "#!") {
+			scriptContent = "#!/bin/bash\nset -e\n" + scriptContent
+		}
+
+		tmpFile, err := os.CreateTemp("", fmt.Sprintf("build-script-%s-*.sh", deployment.Sitename))
+		if err != nil {
+			return fmt.Errorf("failed to create temp script file: %v", err)
+		}
+
+		if _, err := tmpFile.WriteString(scriptContent); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
+			return fmt.Errorf("failed to write script content: %v", err)
+		}
+
+		if err := tmpFile.Close(); err != nil {
+			os.Remove(tmpFile.Name())
+			return fmt.Errorf("failed to close temp script file: %v", err)
+		}
+
+		if err := os.Chmod(tmpFile.Name(), 0755); err != nil {
+			os.Remove(tmpFile.Name())
+			return fmt.Errorf("failed to make script executable: %v", err)
+		}
+
+		scriptPath := tmpFile.Name()
+
+		dockerArgs = append(dockerArgs, "-v", fmt.Sprintf("%s:/usr/local/bin/project-build.sh", scriptPath))
+		log.Printf("Mounted custom build script: %s", scriptPath)
+	}
+
+	dockerArgs = append(dockerArgs, "project-builder", repoURL, branch)
 	dockerArgs = append(dockerArgs, repoConfig.ZipPaths...)
 
 	log.Printf("Building %d zip files: %v", len(repoConfig.ZipPaths), repoConfig.ZipPaths)
@@ -404,6 +477,8 @@ func (ws *WebhookServer) processRepoDeployment(repo, branch string) error {
 	if err != nil {
 		return fmt.Errorf("docker build failed: %v, output: %s", err, string(output))
 	}
+
+	defer os.Remove(scriptPath)
 
 	siteDir := filepath.Join(homeDir, ".wpp-deployer", fmt.Sprintf("wordpress-%s", deployment.Sitename))
 
@@ -428,6 +503,42 @@ func (ws *WebhookServer) processRepoDeployment(repo, branch string) error {
 		} else {
 			log.Printf("Successfully installed plugin: %s", filepath.Base(zipPath))
 		}
+	}
+
+	if repoConfig.WpcliCommands != "" {
+		log.Printf("Executing post-install wpcli commands for %s", deployment.Sitename)
+		cmdList := strings.Split(repoConfig.WpcliCommands, "\n")
+
+		for _, cmdLine := range cmdList {
+			cmdLine = strings.TrimSpace(cmdLine)
+			if cmdLine == "" {
+				continue
+			}
+
+			log.Printf("Executing wpcli command: %s", cmdLine)
+
+			if !strings.HasPrefix(cmdLine, "wp ") {
+				log.Printf("Skipping non-wp command: %s", cmdLine)
+				continue
+			}
+
+			wpArgs := strings.Fields(cmdLine[3:])
+
+			dockerCmd := []string{"compose", "-f", "docker-compose.yml", "run", "-T", "--rm", "wpcli"}
+			dockerCmd = append(dockerCmd, wpArgs...)
+
+			cmd := exec.Command("docker", dockerCmd...)
+			cmd.Dir = siteDir
+
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("wpcli command '%s' failed: %v, output: %s", cmdLine, err, string(output))
+			}
+
+			log.Printf("Command output: %s", strings.TrimSpace(string(output)))
+		}
+
+		log.Printf("Successfully executed post-install wpcli commands")
 	}
 
 	log.Printf("Successfully completed build and deploy for %s:%s on site %s", repo, branch, deployment.Sitename)
