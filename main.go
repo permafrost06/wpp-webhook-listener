@@ -123,7 +123,7 @@ func (ws *WebhookServer) initDB() error {
 		}
 	}
 
-	return ws.initRepoConfigs()
+	return nil
 }
 
 func (ws *WebhookServer) validateSignature(payload []byte, signature string) bool {
@@ -266,73 +266,6 @@ func (ws *WebhookServer) deployNewSite(repo string, branch string) (Deployment, 
 	deployment.Created = time.Now()
 
 	return deployment, nil
-}
-
-func (ws *WebhookServer) initRepoConfigs() error {
-	type repoConfigData struct {
-		zipPaths      []string
-		customScript  string
-		wpcliCommands string
-	}
-
-	configs := map[string]repoConfigData{
-		"dotcamp/ultimate-blocks": {
-			zipPaths: []string{
-				"packages/ultimate-blocks/zip/ultimate-blocks.zip",
-				"packages/pro/zip/ultimate-blocks-pro.zip",
-			},
-			customScript: `#!/bin/bash
-set -e
-echo "Building Ultimate Blocks..."
-pnpm i
-pnpm run build`,
-			wpcliCommands: `wp freemius-license activate ub_pro_fs sk_12345678`,
-		},
-		"dotcamp/tableberg": {
-			zipPaths: []string{
-				"packages/tableberg/tableberg.zip",
-				"packages/pro/tableberg-pro.zip",
-			},
-			customScript: `#!/bin/bash
-set -e
-echo "Building Tableberg..."
-composer install --no-dev
-pnpm i
-pnpm run export`,
-			wpcliCommands: `wp freemius-license activate tp_fs sk_12345678`,
-		},
-	}
-
-	for repo, config := range configs {
-		var configID int
-		err := ws.db.QueryRow("SELECT id FROM repo_configs WHERE repo = ?", repo).Scan(&configID)
-
-		if err == sql.ErrNoRows {
-			result, err := ws.db.Exec("INSERT INTO repo_configs (repo, custom_script, wpcli_commands) VALUES (?, ?, ?)",
-				repo, config.customScript, config.wpcliCommands)
-			if err != nil {
-				return fmt.Errorf("failed to insert repo config for %s: %v", repo, err)
-			}
-
-			id, err := result.LastInsertId()
-			if err != nil {
-				return fmt.Errorf("failed to get insert ID for %s: %v", repo, err)
-			}
-			configID = int(id)
-
-			for _, zipPath := range config.zipPaths {
-				_, err = ws.db.Exec("INSERT INTO repo_zips (repo_config_id, zip_path) VALUES (?, ?)", configID, zipPath)
-				if err != nil {
-					return fmt.Errorf("failed to insert zip path %s for repo %s: %v", zipPath, repo, err)
-				}
-			}
-			log.Printf("Initialized repo config for %s with %d zip paths, custom script, and wpcli commands", repo, len(config.zipPaths))
-		} else if err != nil {
-			return fmt.Errorf("failed to query repo config for %s: %v", repo, err)
-		}
-	}
-
-	return nil
 }
 
 func (ws *WebhookServer) getRepoConfig(repo string) (*RepoConfig, error) {
