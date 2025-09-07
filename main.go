@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
@@ -220,12 +219,16 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, payload *GitHubPayl
 }
 
 func (ws *WebhookServer) buildPluginAndDeploySite(repo string, branch string) {
-	configuredRepos := []string{
-		"dotcamp/tableberg",
-		"dotcamp/ultimate-blocks",
+	// Check if repo is configured in database
+	var count int
+	err := ws.db.QueryRow("SELECT COUNT(*) FROM repo_configs WHERE repo = ?", strings.ToLower(repo)).Scan(&count)
+	if err != nil {
+		log.Printf("Error checking repo configuration for %s: %v", repo, err)
+		return
 	}
 
-	if !slices.Contains(configuredRepos, strings.ToLower(repo)) {
+	if count == 0 {
+		log.Printf("Repository %s is not configured, skipping", repo)
 		return
 	}
 
