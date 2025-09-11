@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v4"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -32,6 +33,90 @@ type GitHubPayload struct {
 	Ref        string     `json:"ref"`
 	Before     string     `json:"before"`
 	After      string     `json:"after"`
+}
+
+type WorkflowRunPayload struct {
+	Action       string       `json:"action"`
+	WorkflowRun  WorkflowRun  `json:"workflow_run"`
+	Repository   Repository   `json:"repository"`
+	Sender       User         `json:"sender"`
+	Installation Installation `json:"installation"`
+}
+
+type WorkflowRun struct {
+	ID           int64      `json:"id"`
+	Name         string     `json:"name"`
+	NodeID       string     `json:"node_id"`
+	HeadBranch   string     `json:"head_branch"`
+	HeadSHA      string     `json:"head_sha"`
+	Path         string     `json:"path"`
+	RunNumber    int        `json:"run_number"`
+	Event        string     `json:"event"`
+	Status       string     `json:"status"`
+	Conclusion   string     `json:"conclusion"`
+	WorkflowID   int64      `json:"workflow_id"`
+	URL          string     `json:"url"`
+	HTMLURL      string     `json:"html_url"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	RunAttempt   int        `json:"run_attempt"`
+	JobsURL      string     `json:"jobs_url"`
+	LogsURL      string     `json:"logs_url"`
+	ArtifactsURL string     `json:"artifacts_url"`
+	HeadCommit   HeadCommit `json:"head_commit"`
+}
+
+type HeadCommit struct {
+	ID        string    `json:"id"`
+	TreeID    string    `json:"tree_id"`
+	Message   string    `json:"message"`
+	Timestamp time.Time `json:"timestamp"`
+	Author    Author    `json:"author"`
+	Committer Author    `json:"committer"`
+}
+
+type Author struct {
+	Name  string `json:"name"`
+	Email string `json:"email"`
+}
+
+type User struct {
+	Login     string `json:"login"`
+	ID        int64  `json:"id"`
+	NodeID    string `json:"node_id"`
+	AvatarURL string `json:"avatar_url"`
+	HTMLURL   string `json:"html_url"`
+	Type      string `json:"type"`
+}
+
+type Installation struct {
+	ID     int64  `json:"id"`
+	NodeID string `json:"node_id"`
+}
+
+type Artifact struct {
+	ID                 int64     `json:"id"`
+	NodeID             string    `json:"node_id"`
+	Name               string    `json:"name"`
+	SizeInBytes        int64     `json:"size_in_bytes"`
+	URL                string    `json:"url"`
+	ArchiveDownloadURL string    `json:"archive_download_url"`
+	Expired            bool      `json:"expired"`
+	CreatedAt          time.Time `json:"created_at"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+type ArtifactsResponse struct {
+	TotalCount int        `json:"total_count"`
+	Artifacts  []Artifact `json:"artifacts"`
+}
+
+type GitHubAppClaims struct {
+	Iat int64  `json:"iat"`
+	Exp int64  `json:"exp"`
+	Iss string `json:"iss"`
+	jwt.RegisteredClaims
 }
 
 type Branch struct {
@@ -169,14 +254,25 @@ func (ws *WebhookServer) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var payload GitHubPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		log.Printf("Error parsing JSON payload: %v", err)
-		http.Error(w, "Error parsing JSON", http.StatusBadRequest)
-		return
+	// Handle workflow_run events separately
+	if eventType == "workflow_run" {
+		var workflowPayload WorkflowRunPayload
+		if err := json.Unmarshal(body, &workflowPayload); err != nil {
+			log.Printf("Error parsing workflow_run payload: %v", err)
+			http.Error(w, "Error parsing JSON", http.StatusBadRequest)
+			return
+		}
+		ws.handleWorkflowRunEvent(&workflowPayload)
+	} else {
+		// Handle other events with existing payload structure
+		var payload GitHubPayload
+		if err := json.Unmarshal(body, &payload); err != nil {
+			log.Printf("Error parsing JSON payload: %v", err)
+			http.Error(w, "Error parsing JSON", http.StatusBadRequest)
+			return
+		}
+		ws.handleGitHubEvent(eventType, &payload)
 	}
-
-	ws.handleGitHubEvent(eventType, &payload)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -213,6 +309,174 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, payload *GitHubPayl
 		fmt.Printf("[%s] 📋 GitHub event: %s from %s\n", timestamp, eventType, repo)
 		if payload.Action != "" {
 			fmt.Printf("         Action: %s\n", payload.Action)
+		}
+		fmt.Println()
+	}
+}
+
+func (ws *WebhookServer) handleWorkflowRunEvent(payload *WorkflowRunPayload) {
+	timestamp := time.Now().Format("15:04:05")
+	repo := payload.Repository.FullName
+	run := payload.WorkflowRun
+
+	// Print workflow run information
+	fmt.Printf("[%s] ⚙️  Workflow Run: %s\n", timestamp, run.Name)
+	fmt.Printf("         Repository: %s\n", repo)
+	fmt.Printf("         Action: %s\n", payload.Action)
+	fmt.Printf("         Status: %s\n", run.Status)
+	if run.Conclusion != "" {
+		fmt.Printf("         Conclusion: %s\n", run.Conclusion)
+	}
+	fmt.Printf("         Branch: %s\n", run.HeadBranch)
+	fmt.Printf("         Commit: %s\n", run.HeadSHA[:8])
+	fmt.Printf("         Run Number: #%d\n", run.RunNumber)
+	fmt.Printf("         Event: %s\n", run.Event)
+	fmt.Printf("         URL: %s\n", run.HTMLURL)
+
+	// If the workflow run is completed, fetch artifacts
+	if payload.Action == "completed" {
+		ws.fetchAndDisplayArtifacts(repo, run.ID, payload.Installation.ID)
+	}
+
+	fmt.Println()
+}
+
+func (ws *WebhookServer) generateGitHubAppJWT() (string, error) {
+	appID := os.Getenv("GITHUB_APP_ID")
+	privateKeyPath := os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")
+	privateKeyData := os.Getenv("GITHUB_APP_PRIVATE_KEY")
+
+	if appID == "" {
+		return "", fmt.Errorf("GITHUB_APP_ID not set")
+	}
+
+	var privateKeyBytes []byte
+	var err error
+
+	if privateKeyPath != "" {
+		privateKeyBytes, err = os.ReadFile(privateKeyPath)
+	} else if privateKeyData != "" {
+		privateKeyBytes = []byte(privateKeyData)
+	} else {
+		return "", fmt.Errorf("neither GITHUB_APP_PRIVATE_KEY_PATH nor GITHUB_APP_PRIVATE_KEY is set")
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("failed to read private key: %v", err)
+	}
+
+	privateKey, err := jwt.ParseRSAPrivateKeyFromPEM(privateKeyBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse private key: %v", err)
+	}
+
+	now := time.Now()
+	claims := &GitHubAppClaims{
+		Iat: now.Unix(),
+		Exp: now.Add(10 * time.Minute).Unix(), // GitHub requires max 10 minutes
+		Iss: appID,
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	return token.SignedString(privateKey)
+}
+
+func (ws *WebhookServer) getInstallationTokenByID(installationID int64) (string, error) {
+	jwtToken, err := ws.generateGitHubAppJWT()
+	if err != nil {
+		return "", fmt.Errorf("failed to generate JWT: %v", err)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	url := fmt.Sprintf("https://api.github.com/app/installations/%d/access_tokens", installationID)
+
+	req, err := http.NewRequest("POST", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+jwtToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to get installation token: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		return "", fmt.Errorf("GitHub API error: %s", resp.Status)
+	}
+
+	var tokenResp struct {
+		Token     string    `json:"token"`
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return "", fmt.Errorf("failed to parse token response: %v", err)
+	}
+
+	return tokenResp.Token, nil
+}
+
+func (ws *WebhookServer) fetchAndDisplayArtifacts(repo string, runID int64, installationID int64) {
+	// Get installation access token
+	apiToken, err := ws.getInstallationTokenByID(installationID)
+	if err != nil {
+		fmt.Printf("         [⚠️] Failed to get GitHub App token: %v\n", err)
+		return
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	url := fmt.Sprintf("https://api.github.com/repos/%s/actions/runs/%d/artifacts", repo, runID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		log.Printf("Error creating artifacts request: %v", err)
+		return
+	}
+
+	req.Header.Set("Authorization", "Bearer "+apiToken)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error fetching artifacts: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("GitHub API error: %s", resp.Status)
+		return
+	}
+
+	var artifactsResp ArtifactsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&artifactsResp); err != nil {
+		log.Printf("Error parsing artifacts response: %v", err)
+		return
+	}
+
+	// Display artifact information
+	fmt.Printf("         📦 Artifacts (%d total):\n", artifactsResp.TotalCount)
+	if artifactsResp.TotalCount == 0 {
+		fmt.Printf("           No artifacts found\n")
+		return
+	}
+
+	for _, artifact := range artifactsResp.Artifacts {
+		fmt.Printf("           - %s (%d bytes)\n", artifact.Name, artifact.SizeInBytes)
+		fmt.Printf("             ID: %d\n", artifact.ID)
+		fmt.Printf("             Created: %s\n", artifact.CreatedAt.Format("2006-01-02 15:04:05"))
+		fmt.Printf("             Expires: %s\n", artifact.ExpiresAt.Format("2006-01-02 15:04:05"))
+		fmt.Printf("             Download URL: %s\n", artifact.ArchiveDownloadURL)
+		if artifact.Expired {
+			fmt.Printf("             Status: ⚠️ EXPIRED\n")
+		} else {
+			fmt.Printf("             Status: ✅ Available\n")
 		}
 		fmt.Println()
 	}
@@ -537,6 +801,11 @@ Commands:
 Options:
   --port PORT          Webhook server port (default: 3000)
   --secret SECRET      GitHub webhook secret for validation
+
+Environment Variables (for GitHub App authentication):
+  GITHUB_APP_ID                GitHub App ID
+  GITHUB_APP_PRIVATE_KEY_PATH  Path to GitHub App private key file
+  GITHUB_APP_PRIVATE_KEY       GitHub App private key content (alternative to path)
 
 Examples:
   %s listen
