@@ -134,9 +134,10 @@ type Repository struct {
 }
 
 type WebhookServer struct {
-	port   string
-	secret string
-	db     *sql.DB
+	port    string
+	secret  string
+	db      *sql.DB
+	dotPath string
 }
 
 type Deployment struct {
@@ -169,16 +170,24 @@ type GitHubWorkflowConfig struct {
 
 func NewWebhookServer(port, secret string) *WebhookServer {
 	homeDir, err := os.UserHomeDir()
-	dbLocation := filepath.Join(homeDir, ".wpp-deployer", "deployments.db")
+	if err != nil {
+		log.Fatalf("failed to get home directory: %v", err)
+		return nil
+	}
+
+	dotPath := filepath.Join(homeDir, ".wpp-deployer")
+
+	dbLocation := filepath.Join(dotPath, "deployments.db")
 	db, err := sql.Open("sqlite3", dbLocation)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 
 	ws := &WebhookServer{
-		port:   port,
-		secret: secret,
-		db:     db,
+		port:    port,
+		secret:  secret,
+		db:      db,
+		dotPath: dotPath,
 	}
 
 	if err := ws.initDB(); err != nil {
@@ -416,11 +425,6 @@ func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repo
 
 	repo := strings.ToLower(payload.Repository.FullName)
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %v", err)
-	}
-
 	apiToken, err := ws.getInstallationTokenByID(payload.Installation.ID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get GitHub App token: %v", err)
@@ -461,7 +465,7 @@ func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repo
 
 	log.Printf("Looking for artifacts matching: %v", workflowConfig.ArtifactNames)
 
-	outputDir := filepath.Join(homeDir, ".wpp-deployer", "docker-build-output", sitename)
+	outputDir := filepath.Join(ws.dotPath, "docker-build-output", sitename)
 
 	for _, artifact := range artifactsResp.Artifacts {
 		if !matchingArtifacts[artifact.Name] {
@@ -732,17 +736,12 @@ func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *Re
 
 	repoURL := fmt.Sprintf("https://github.com/%s", dockerConfig.Repo)
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get home directory: %v", err)
-	}
-
-	absOutputDir, err := filepath.Abs(filepath.Join(homeDir, ".wpp-deployer", "docker-build-output", sitename))
+	absOutputDir, err := filepath.Abs(filepath.Join(ws.dotPath, "docker-build-output", sitename))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for output dir: %v", err)
 	}
 
-	absStoreDir, err := filepath.Abs(filepath.Join(homeDir, ".wpp-deployer", "pnpm-store"))
+	absStoreDir, err := filepath.Abs(filepath.Join(ws.dotPath, "pnpm-store"))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get absolute path for pnpm store dir: %v", err)
 	}
@@ -819,12 +818,7 @@ func (ws *WebhookServer) installPlugins(zipFiles []string, sitename string) erro
 		return nil
 	}
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %v", err)
-	}
-
-	siteDir := filepath.Join(homeDir, ".wpp-deployer", fmt.Sprintf("wordpress-%s", sitename))
+	siteDir := filepath.Join(ws.dotPath, fmt.Sprintf("wordpress-%s", sitename))
 
 	log.Printf("Installing %d plugins on site %s", len(zipFiles), sitename)
 
@@ -851,12 +845,7 @@ func (ws *WebhookServer) executeWpCliCommands(wpcliCommands, sitename string) er
 		return nil
 	}
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("failed to get home directory: %v", err)
-	}
-
-	siteDir := filepath.Join(homeDir, ".wpp-deployer", fmt.Sprintf("wordpress-%s", sitename))
+	siteDir := filepath.Join(ws.dotPath, fmt.Sprintf("wordpress-%s", sitename))
 
 	log.Printf("Executing post-install wpcli commands for %s", sitename)
 	cmdList := strings.SplitSeq(wpcliCommands, "\n")
