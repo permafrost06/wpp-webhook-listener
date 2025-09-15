@@ -47,7 +47,13 @@ func (ws *WebhookServer) deploySiteOrUseExisting(repo string, branch string) (*D
 
 	if !strings.Contains(string(output), sitename) {
 		log.Printf("Deploying new site: %s", sitename)
-		if err := exec.Command("wpp-deployer", "deploy", sitename).Run(); err != nil {
+
+		err := os.Mkdir(filepath.Join(ws.dotPath, "docker-build-output", sitename), 0755)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create build output dir for %s", sitename)
+		}
+
+		if err = exec.Command("wpp-deployer", "deploy", sitename).Run(); err != nil {
 			return nil, fmt.Errorf("failed to deploy site %s: %v", sitename, err)
 		}
 		log.Printf("Successfully deployed site: %s", sitename)
