@@ -356,7 +356,7 @@ func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repo
 
 	log.Printf("Successfully retrieved GitHub workflow artifacts for workflow %s on %s:%s", payload.WorkflowRun.Name, repo, branch)
 
-	return []string{}, nil
+	return downloadedFiles, nil
 }
 
 func (ws *WebhookServer) installPlugins(zipFiles []string, sitename string) error {
