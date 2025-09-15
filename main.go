@@ -305,7 +305,6 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, body []byte) error 
 			}
 		}
 
-		fmt.Println()
 	case "ping":
 		fmt.Printf("[%s] 🏓 Webhook ping from %s\n", timestamp, repo)
 		fmt.Println("         Webhook successfully configured!")
