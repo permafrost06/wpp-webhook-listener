@@ -24,51 +24,51 @@ func (ws *WebhookServer) deploySiteOrUseExisting(repo string, branch string) (*D
 		repo, branch,
 	).Scan(&deployment.ID, &deployment.Repo, &deployment.Branch, &deployment.Sitename, &deployment.Description, &deployment.Created)
 
-	if err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("failed to query deployment: %v", err)
-	}
-
-	if err == sql.ErrNoRows {
-		const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
-		b := make([]byte, 8)
-		rand.Read(b)
-		for i := range b {
-			b[i] = chars[b[i]%byte(len(chars))]
-		}
-		sitename := string(b)
-
-		output, err := exec.Command("wpp-deployer", "list").Output()
-		if err != nil {
-			return nil, fmt.Errorf("failed to list deployments: %v", err)
-		}
-
-		if !strings.Contains(string(output), sitename) {
-			log.Printf("Deploying new site: %s", sitename)
-			if err := exec.Command("wpp-deployer", "deploy", sitename).Run(); err != nil {
-				return nil, fmt.Errorf("failed to deploy site %s: %v", sitename, err)
-			}
-			log.Printf("Successfully deployed site: %s", sitename)
-		} else {
-			log.Printf("Site %s already exists", sitename)
-		}
-
-		_, err = ws.db.Exec(
-			"INSERT INTO deployments (repo, branch, sitename) VALUES (?, ?, ?)",
-			repo, branch, sitename,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to insert deployment: %v", err)
-		}
-
-		deployment.Repo = &repo
-		deployment.Branch = &branch
-		deployment.Sitename = sitename
-		deployment.Created = time.Now()
-
+	if err == nil {
 		return &deployment, nil
 	}
 
-	return nil, nil
+	if err != sql.ErrNoRows {
+		return nil, fmt.Errorf("failed to query deployment: %v", err)
+	}
+
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 8)
+	rand.Read(b)
+	for i := range b {
+		b[i] = chars[b[i]%byte(len(chars))]
+	}
+	sitename := string(b)
+
+	output, err := exec.Command("wpp-deployer", "list").Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list deployments: %v", err)
+	}
+
+	if !strings.Contains(string(output), sitename) {
+		log.Printf("Deploying new site: %s", sitename)
+		if err := exec.Command("wpp-deployer", "deploy", sitename).Run(); err != nil {
+			return nil, fmt.Errorf("failed to deploy site %s: %v", sitename, err)
+		}
+		log.Printf("Successfully deployed site: %s", sitename)
+	} else {
+		log.Printf("Site %s already exists", sitename)
+	}
+
+	_, err = ws.db.Exec(
+		"INSERT INTO deployments (repo, branch, sitename) VALUES (?, ?, ?)",
+		repo, branch, sitename,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert deployment: %v", err)
+	}
+
+	deployment.Repo = &repo
+	deployment.Branch = &branch
+	deployment.Sitename = sitename
+	deployment.Created = time.Now()
+
+	return &deployment, nil
 }
 
 func (ws *WebhookServer) deployPlugins(
