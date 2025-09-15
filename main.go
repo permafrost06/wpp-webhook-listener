@@ -296,7 +296,7 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, body []byte) error 
 			if repoConfig.BuildMode == "github_workflow" {
 				go func() {
 					log.Printf("Starting deploy process github workflow artifacts for %s:%s", repo, run.HeadBranch)
-					if err := ws.deployPlugins(&repoConfig, run.HeadBranch, nil, ws.retrieveWorkflowArtifacts); err != nil {
+					if err := ws.deployPlugins(&repoConfig, run.HeadBranch, &payload, ws.retrieveWorkflowArtifacts); err != nil {
 						log.Printf("Error processing github workflow deployment for %s:%s - %v", repo, run.HeadBranch, err)
 					}
 				}()
