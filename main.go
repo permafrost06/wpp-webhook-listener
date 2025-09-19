@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -160,6 +162,20 @@ type GitHubWorkflowConfig struct {
 	RepositoryConfig
 	WorkflowName  *string  `json:"workflow_name"`
 	ArtifactNames []string `json:"artifact_names"`
+}
+
+type TriggerDeployRequest struct {
+	Repo   string `json:"repo"`
+	Branch string `json:"branch"`
+}
+
+type TriggerDeployResponse struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+type ErrorResponse struct {
+	Error string `json:"error"`
 }
 
 func NewWebhookServer(port, secret string) *WebhookServer {
@@ -331,11 +347,112 @@ func (ws *WebhookServer) healthCheck(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (ws *WebhookServer) basicAuth(handler http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		deployToken := os.Getenv("DEPLOY_API_TOKEN")
+		if deployToken == "" {
+			log.Printf("DEPLOY_API_TOKEN not configured")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		auth := r.Header.Get("Authorization")
+		if auth == "" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Deploy API"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		if !strings.HasPrefix(auth, "Basic ") {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		encoded := strings.TrimPrefix(auth, "Basic ")
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		credentials := strings.SplitN(string(decoded), ":", 2)
+		if len(credentials) != 2 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		if subtle.ConstantTimeCompare([]byte(credentials[1]), []byte(deployToken)) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		handler(w, r)
+	}
+}
+
+func (ws *WebhookServer) triggerDeploy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req TriggerDeployRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON request"})
+		return
+	}
+
+	if req.Repo == "" || req.Branch == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Both repo and branch are required"})
+		return
+	}
+
+	var repoConfig RepositoryConfig
+	err := ws.db.QueryRow(`
+		SELECT id, repo, build_mode, wpcli_commands 
+		FROM repositories 
+		WHERE repo = ?`, strings.ToLower(req.Repo)).Scan(
+		&repoConfig.ID, &repoConfig.Repo, &repoConfig.BuildMode, &repoConfig.WpcliCommands)
+
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Repository %s is not configured", req.Repo)})
+		return
+	}
+
+	if repoConfig.BuildMode != "docker" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: fmt.Sprintf("Repository %s is not configured for Docker builds", req.Repo)})
+		return
+	}
+
+	go func() {
+		log.Printf("Manual trigger: Starting Docker build and deploy process for %s:%s", req.Repo, req.Branch)
+		if err := ws.deployPlugins(&repoConfig, req.Branch, nil, ws.buildWithDocker); err != nil {
+			log.Printf("Manual trigger: Error processing Docker deployment for %s:%s - %v", req.Repo, req.Branch, err)
+		}
+	}()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(TriggerDeployResponse{
+		Status:  "started",
+		Message: fmt.Sprintf("Deployment started for %s:%s", req.Repo, req.Branch),
+	})
+}
+
 func (ws *WebhookServer) Start() error {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/webhook", ws.handleWebhook)
 	mux.HandleFunc("/health", ws.healthCheck)
+	mux.HandleFunc("/trigger-deploy", ws.basicAuth(ws.triggerDeploy))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -343,7 +460,7 @@ func (ws *WebhookServer) Start() error {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "Webhook Listener v%s\nEndpoints:\n  POST /webhook - GitHub webhooks\n  GET /health - Health check\n", version)
+		fmt.Fprintf(w, "Webhook Listener v%s\nEndpoints:\n  POST /webhook - GitHub webhooks\n  GET /health - Health check\n  POST /trigger-deploy - Manual plugin deployment (requires auth)\n", version)
 	})
 
 	server := &http.Server{
@@ -355,6 +472,7 @@ func (ws *WebhookServer) Start() error {
 	fmt.Println("📋 Endpoints:")
 	fmt.Printf("    POST http://localhost:%s/webhook - GitHub webhooks\n", ws.port)
 	fmt.Printf("    GET  http://localhost:%s/health  - Health check\n", ws.port)
+	fmt.Printf("    POST http://localhost:%s/trigger-deploy - Manual deployment (requires auth)\n", ws.port)
 	fmt.Println()
 	fmt.Println("🔗 Configure GitHub webhook URL: http://your-domain.com/webhook")
 	fmt.Println("📝 Listening for GitHub events...")
