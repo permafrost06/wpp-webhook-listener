@@ -285,7 +285,13 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, body []byte) error 
 		if repoConfig.BuildMode == "docker" {
 			go func() {
 				log.Printf("Starting Docker build and deploy process for %s:%s", repo, branch)
-				if err := ws.deployPlugins(&repoConfig, branch, nil, ws.buildWithDocker); err != nil {
+
+				pluginZips, err := ws.buildWithDocker(branch, &repoConfig)
+                if err != nil {
+                	log.Printf("Building with docker failed: %v", err)
+                }
+
+				if err := ws.deployPlugins(&repoConfig, branch, pluginZips); err != nil {
 					log.Printf("Error processing Docker deployment for %s:%s - %v", repo, branch, err)
 				}
 			}()
@@ -312,7 +318,13 @@ func (ws *WebhookServer) handleGitHubEvent(eventType string, body []byte) error 
 			if repoConfig.BuildMode == "github_workflow" {
 				go func() {
 					log.Printf("Starting deploy process github workflow artifacts for %s:%s", repo, run.HeadBranch)
-					if err := ws.deployPlugins(&repoConfig, run.HeadBranch, &payload, ws.retrieveWorkflowArtifacts); err != nil {
+
+					pluginZips, err := ws.retrieveWorkflowArtifacts(run.HeadBranch, &repoConfig, &payload)
+					if err != nil {
+						log.Printf("Building with docker failed: %v", err)
+					}
+
+					if err := ws.deployPlugins(&repoConfig, run.HeadBranch, pluginZips); err != nil {
 						log.Printf("Error processing github workflow deployment for %s:%s - %v", repo, run.HeadBranch, err)
 					}
 				}()
@@ -434,7 +446,13 @@ func (ws *WebhookServer) triggerDeploy(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		log.Printf("Manual trigger: Starting Docker build and deploy process for %s:%s", req.Repo, req.Branch)
-		if err := ws.deployPlugins(&repoConfig, req.Branch, nil, ws.buildWithDocker); err != nil {
+
+		pluginZips, err := ws.buildWithDocker(req.Branch, &repoConfig)
+		if err != nil {
+			log.Printf("Building with docker failed: %v", err)
+		}
+
+		if err := ws.deployPlugins(&repoConfig, req.Branch, pluginZips); err != nil {
 			log.Printf("Manual trigger: Error processing Docker deployment for %s:%s - %v", req.Repo, req.Branch, err)
 		}
 	}()

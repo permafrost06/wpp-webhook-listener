@@ -80,8 +80,7 @@ func (ws *WebhookServer) deploySiteOrUseExisting(repo string, branch string) (*D
 func (ws *WebhookServer) deployPlugins(
 	repoConfig *RepositoryConfig,
 	branch string,
-	workflowPayload *WorkflowRunPayload,
-	buildStep func(branch string, sitename string, repoConfig *RepositoryConfig, workflowPayload *WorkflowRunPayload) ([]string, error),
+	pluginZips []string,
 ) error {
 	repo := repoConfig.Repo
 
@@ -90,9 +89,13 @@ func (ws *WebhookServer) deployPlugins(
 		return fmt.Errorf("Failed to deploy new site or get existing: %v", err)
 	}
 
-	pluginZips, err := buildStep(branch, deployment.Sitename, repoConfig, workflowPayload)
-	if err != nil {
-		return fmt.Errorf("Build step failed: %v", err)
+	outputDir := filepath.Join(ws.dotPath, "docker-build-output", deployment.Sitename)
+
+	for _, zip := range pluginZips {
+		err := os.Rename(zip, filepath.Join(outputDir, filepath.Base(zip)))
+		if err != nil {
+			return fmt.Errorf("failed to move plugin zips to proper directory")
+		}
 	}
 
 	if err := ws.installPlugins(pluginZips, deployment.Sitename); err != nil {
@@ -107,7 +110,7 @@ func (ws *WebhookServer) deployPlugins(
 	return nil
 }
 
-func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *RepositoryConfig, workflowPayload *WorkflowRunPayload) ([]string, error) {
+func (ws *WebhookServer) buildWithDocker(branch string, repoConfig *RepositoryConfig) ([]string, error) {
 	var customScript string
 	var zipPathsJSON string
 
@@ -136,9 +139,11 @@ func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *Re
 
 	repoURL := fmt.Sprintf("https://github.com/%s", dockerConfig.Repo)
 
-	absOutputDir, err := filepath.Abs(filepath.Join(ws.dotPath, "docker-build-output", sitename))
+	modifiedRepoName := strings.ReplaceAll(repoConfig.Repo, "/", "--")
+
+	tempOutputDir, err := os.MkdirTemp("", fmt.Sprintf("%s-%s-*", modifiedRepoName, branch))
 	if err != nil {
-		return nil, fmt.Errorf("failed to get absolute path for output dir: %v", err)
+		return nil, fmt.Errorf("failed to create temp output dir: %v", err)
 	}
 
 	absStoreDir, err := filepath.Abs(filepath.Join(ws.dotPath, "pnpm-store"))
@@ -147,7 +152,7 @@ func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *Re
 	}
 
 	dockerArgs := []string{
-		"run", "-v", fmt.Sprintf("%s:/output", absOutputDir),
+		"run", "-v", fmt.Sprintf("%s:/output", tempOutputDir),
 		"-v", fmt.Sprintf("%s:/pnpm/store", absStoreDir),
 	}
 
@@ -158,7 +163,7 @@ func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *Re
 			scriptContent = "#!/bin/bash\nset -e\n" + scriptContent
 		}
 
-		tmpFile, err := os.CreateTemp("", fmt.Sprintf("build-script-%s-*.sh", sitename))
+		tmpFile, err := os.CreateTemp("", fmt.Sprintf("build-script-%s-*.sh", modifiedRepoName))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create temp script file: %v", err)
 		}
@@ -199,7 +204,7 @@ func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *Re
 
 	var zipFiles []string
 	for _, zipPath := range dockerConfig.ZipPaths {
-		builtZipPath := filepath.Join(absOutputDir, filepath.Base(zipPath))
+		builtZipPath := filepath.Join(tempOutputDir, filepath.Base(zipPath))
 		if _, err := os.Stat(builtZipPath); os.IsNotExist(err) {
 			log.Printf("Warning: expected zip file not found: %s", builtZipPath)
 			continue
@@ -212,7 +217,7 @@ func (ws *WebhookServer) buildWithDocker(branch, sitename string, repoConfig *Re
 	return zipFiles, nil
 }
 
-func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repoConfig *RepositoryConfig, payload *WorkflowRunPayload) ([]string, error) {
+func (ws *WebhookServer) retrieveWorkflowArtifacts(branch string, repoConfig *RepositoryConfig, payload *WorkflowRunPayload) ([]string, error) {
 	var workflowName sql.NullString
 	var artifactNamesJSON string
 
@@ -288,7 +293,12 @@ func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repo
 
 	log.Printf("Looking for artifacts matching: %v", workflowConfig.ArtifactNames)
 
-	outputDir := filepath.Join(ws.dotPath, "docker-build-output", sitename)
+	modifiedRepoName := strings.ReplaceAll(repoConfig.Repo, "/", "--")
+
+	tempOutputDir, err := os.MkdirTemp("", fmt.Sprintf("%s-%s-*", modifiedRepoName, branch))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp output dir: %v", err)
+	}
 
 	for _, artifact := range artifactsResp.Artifacts {
 		if !matchingArtifacts[artifact.Name] {
@@ -325,7 +335,7 @@ func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repo
 			continue
 		}
 
-		artifactPath := filepath.Join(outputDir, fmt.Sprintf("%s.zip", artifact.Name))
+		artifactPath := filepath.Join(tempOutputDir, fmt.Sprintf("%s.zip", artifact.Name))
 		artifactFile, err := os.Create(artifactPath)
 		if err != nil {
 			log.Printf("Error creating file for artifact %s: %v", artifact.Name, err)
@@ -352,13 +362,11 @@ func (ws *WebhookServer) retrieveWorkflowArtifacts(branch, sitename string, repo
 		expandIfNestedZip(absZipPath)
 	}
 
-	log.Printf("Downloaded %d matching artifacts to %s", len(downloadedFiles), outputDir)
+	log.Printf("Downloaded %d matching artifacts to %s", len(downloadedFiles), tempOutputDir)
 
 	if len(downloadedFiles) == 0 {
 		return nil, fmt.Errorf("No matching artifacts found for %s", repo)
 	}
-
-	log.Printf("Using site: %s for %s:%s", sitename, repo, branch)
 
 	log.Printf("Successfully retrieved GitHub workflow artifacts for workflow %s on %s:%s", payload.WorkflowRun.Name, repo, branch)
 
